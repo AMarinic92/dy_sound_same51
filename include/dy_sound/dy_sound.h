@@ -194,7 +194,12 @@ typedef enum
     /** The transmit path stalled - the SERCOM never reported its data register
      *  empty. Almost always a SERCOM that MCC did not enable, or one that is
      *  not in USART mode. */
-    DY_EVENT_TX_TIMEOUT
+    DY_EVENT_TX_TIMEOUT,
+
+    /** Answer to dy_sound_rtos_query_track(). `track` and `reported` are both
+     *  what the module says it is playing. A module that does not answer
+     *  reports DY_EVENT_NO_REPLY with `track` 0 instead. */
+    DY_EVENT_TRACK
 } dy_event_t;
 
 typedef void (*dy_event_cb_t)(uintptr_t context, dy_event_t event,

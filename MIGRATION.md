@@ -15,6 +15,7 @@ a track.
 | `Mast.setLoopRule(mastLoops)` | a `cycle` column in the bank table |
 | `Mast.play(14)` | `dy_sound_rtos_play(&mast, 14)` |
 | `Mast.confirmed()` | `dy_sound_confirmed(&mast)` |
+| `Mast.requestTrack()` | `dy_sound_rtos_query_track(&mast)`, answer as `DY_EVENT_TRACK` |
 | `Mast.sendRaw(...)` | `dy_sound_send_raw(...)` |
 | `Serial.print` inside the driver | `cfg.on_event` callback |
 | `freertos_due_begin/start` | plain `vTaskStartScheduler()` |

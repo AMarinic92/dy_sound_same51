@@ -29,7 +29,8 @@ typedef enum
     DY_OP_NEXT,
     DY_OP_PREVIOUS,
     DY_OP_SET_VOLUME,
-    DY_OP_SET_CYCLE
+    DY_OP_SET_CYCLE,
+    DY_OP_QUERY_TRACK
 } dy_op_t;
 
 typedef struct
@@ -80,6 +81,22 @@ static bool dy_post(dy_sound_t *dev, const dy_cue_t *cue)
     return true;
 }
 
+/* Answers dy_sound_rtos_query_track(). A silent module leaves `track` at 0,
+ * which is what DY_EVENT_NO_REPLY carries for a query. */
+static void dy_report_track(dy_sound_t *dev)
+{
+    uint16_t track    = 0u;
+    bool     answered = dy_sound_query_track(dev, &track);
+
+    if (dev->on_event != NULL)
+    {
+        dev->on_event(dev->context,
+                      answered ? DY_EVENT_TRACK : DY_EVENT_NO_REPLY,
+                      track,
+                      answered ? (int)track : -1);
+    }
+}
+
 static void dy_run(void *arg)
 {
     dy_sound_t *dev = (dy_sound_t *)arg;
@@ -128,6 +145,10 @@ static void dy_run(void *arg)
 
             case DY_OP_SET_VOLUME:
                 (void)dy_sound_set_volume(dev, cue.arg);
+                break;
+
+            case DY_OP_QUERY_TRACK:
+                dy_report_track(dev);
                 break;
 
             case DY_OP_SET_CYCLE:
@@ -288,6 +309,11 @@ bool dy_sound_rtos_set_cycle(dy_sound_t *dev, uint8_t mode)
     }
 
     return dy_post_simple(dev, DY_OP_SET_CYCLE, 0u, mode);
+}
+
+bool dy_sound_rtos_query_track(dy_sound_t *dev)
+{
+    return dy_post_simple(dev, DY_OP_QUERY_TRACK, 0u, 0u);
 }
 
 bool dy_sound_rtos_flush(dy_sound_t *dev)

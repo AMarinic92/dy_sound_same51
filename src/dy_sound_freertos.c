@@ -341,6 +341,11 @@ bool dy_sound_rtos_set_cycle(dy_sound_t *dev, uint8_t mode)
     return dy_post_simple(dev, DY_OP_SET_CYCLE, 0u, mode);
 }
 
+bool dy_sound_rtos_query_track(dy_sound_t *dev)
+{
+    return dy_post_simple(dev, DY_OP_QUERY_TRACK, 0u, 0u);
+}
+
 bool dy_sound_rtos_flush(dy_sound_t *dev)
 {
     if ((dev == NULL) || (dev->queue == NULL))

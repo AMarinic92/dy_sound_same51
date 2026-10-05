@@ -416,6 +416,12 @@ the application decide whether a line is worth printing.
 | `DY_EVENT_MISMATCH` | Module named a different track and the retries ran out. |
 | `DY_EVENT_DROPPED` | Queue was full. Fires in the caller's task. |
 | `DY_EVENT_TX_TIMEOUT` | The SERCOM never reported its data register empty. |
+| `DY_EVENT_TRACK` | Answer to `dy_sound_rtos_query_track()`. `track` is what the module is playing. |
+
+`dy_sound_rtos_query_track()` exists for a BUSY-line interrupt: the edge says a
+sound started, the query asks which. It is queued like a cue, so it runs on the
+sound task and never collides with a play on the wire. Silence comes back as
+`DY_EVENT_NO_REPLY` with track 0.
 
 Events fire from task context, never an ISR, so `printf` is fine if your config
 allows it — raise `stack_words` if you do.

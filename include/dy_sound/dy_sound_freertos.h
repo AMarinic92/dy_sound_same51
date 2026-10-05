@@ -152,6 +152,17 @@ bool dy_sound_rtos_set_volume(dy_sound_t *dev, uint8_t volume);
 bool dy_sound_rtos_set_cycle(dy_sound_t *dev, uint8_t mode);
 
 /**
+ * Ask the module which track it is playing. The query runs on the sound task,
+ * behind any cues already queued, so it cannot land in the middle of a play's
+ * frames. The answer comes back through on_event: DY_EVENT_TRACK with the
+ * track, or DY_EVENT_NO_REPLY with track 0 if the module did not answer.
+ *
+ * Made for a BUSY-line interrupt: the edge says something started, this says
+ * what. Post it from the task the ISR wakes, not from the ISR.
+ */
+bool dy_sound_rtos_query_track(dy_sound_t *dev);
+
+/**
  * Drop every cue still waiting, without disturbing whatever is playing. Use
  * when a room resets and the backlog is now wrong.
  */

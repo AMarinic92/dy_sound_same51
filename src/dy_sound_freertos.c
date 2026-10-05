@@ -29,7 +29,14 @@ typedef enum
     DY_OP_NEXT,
     DY_OP_PREVIOUS,
     DY_OP_SET_VOLUME,
-    DY_OP_SET_CYCLE
+    DY_OP_SET_CYCLE,
+
+    /* Carries nothing. The request itself lives in the device's ask_flags,
+     * where an ISR can OR into it and repeated edges coalesce; this op exists
+     * only to WAKE the task so it will go and look. Putting the bits in the cue
+     * instead would make a bouncing BUSY line fill the queue with eight
+     * identical questions and then start dropping real cues. */
+    DY_OP_ASK
 } dy_op_t;
 
 typedef struct
@@ -78,6 +85,38 @@ static bool dy_post(dy_sound_t *dev, const dy_cue_t *cue)
     }
 
     return true;
+}
+
+/* The interrupt-safe twin of dy_post().
+ *
+ * No DY_EVENT_DROPPED on a full queue: on_event is application code and in
+ * every project so far it prints. An ISR is not the place for that, and a
+ * driver that calls back into printf from a handler is a driver that gets
+ * blamed for a hang it only triggered. The false return is the report. */
+static bool dy_post_isr(dy_sound_t *dev, const dy_cue_t *cue, BaseType_t *woken)
+{
+    BaseType_t  local = pdFALSE;
+    BaseType_t *flag  = (woken != NULL) ? woken : &local;
+    BaseType_t  sent;
+
+    if ((dev == NULL) || (dev->queue == NULL))
+    {
+        return false;
+    }
+
+    sent = xQueueSendFromISR((QueueHandle_t)dev->queue, cue, flag);
+
+    /* Given a flag, the caller owns the yield and we must not do it here -
+     * yielding mid-handler when the caller intends to fold several flags
+     * together is how half a handler ends up running after the switch. Given
+     * NULL, the caller has said this is the only thing the handler does, so
+     * the yield is ours. */
+    if (woken == NULL)
+    {
+        portYIELD_FROM_ISR(local);
+    }
+
+    return sent == pdPASS;
 }
 
 static void dy_run(void *arg)
@@ -130,11 +169,23 @@ static void dy_run(void *arg)
                 (void)dy_sound_set_volume(dev, cue.arg);
                 break;
 
+            case DY_OP_ASK:
+                /* Nothing to do here - dy_sound_service() below is the whole
+                 * handler. The cue was the wake-up. */
+                break;
+
             case DY_OP_SET_CYCLE:
             default:
                 (void)dy_sound_set_cycle(dev, cue.arg);
                 break;
         }
+
+        /* After every cue, not just after DY_OP_ASK. A request raised while the
+         * queue was backed up would otherwise sit there until something else
+         * happened to wake the task; this way the next cue to come off the
+         * queue serves it. Costs a flag test when nothing is pending, which is
+         * almost always. */
+        (void)dy_sound_service(dev);
     }
 }
 
@@ -302,6 +353,85 @@ bool dy_sound_rtos_flush(dy_sound_t *dev)
      * make a queue reset audible. */
     return xQueueReset((QueueHandle_t)dev->queue) == pdPASS;
 }
+
+bool dy_sound_rtos_ask(dy_sound_t *dev, uint8_t what)
+{
+    if ((dev == NULL) || ((what & (uint8_t)DY_ASK_BOTH) == 0u))
+    {
+        return false;
+    }
+
+    /* Bits first, wake-up second. In the other order the task could run, find
+     * nothing pending and go back to sleep, and the request would wait for
+     * whatever happened to come next. */
+    dy_sound_ask(dev, what);
+
+    return dy_post_simple(dev, DY_OP_ASK, 0u, 0u);
+}
+
+/* -- From an interrupt ------------------------------------------------------ */
+
+bool dy_sound_rtos_ask_from_isr(dy_sound_t *dev, uint8_t what, BaseType_t *woken)
+{
+    dy_cue_t cue;
+
+    if ((dev == NULL) || ((what & (uint8_t)DY_ASK_BOTH) == 0u))
+    {
+        return false;
+    }
+
+    dy_sound_ask(dev, what);
+
+    cue.track = 0u;
+    cue.op    = (uint8_t)DY_OP_ASK;
+    cue.arg   = 0u;
+
+    /* A full queue is survivable here in a way it is not for a cue: the bits
+     * are already raised, and the task calls dy_sound_service() after every
+     * item it pulls off that queue. The request is answered late rather than
+     * lost, which is why this returns false without anyone needing to retry. */
+    return dy_post_isr(dev, &cue, woken);
+}
+
+static bool dy_post_play_isr(dy_sound_t *dev, uint16_t track, bool confirm,
+                             BaseType_t *woken)
+{
+    dy_cue_t cue;
+
+    if (track == 0u)
+    {
+        return false;
+    }
+
+    cue.track = track;
+    cue.op    = (uint8_t)(confirm ? DY_OP_PLAY : DY_OP_PLAY_NOWAIT);
+    cue.arg   = (uint8_t)DY_CYCLE_KEEP;
+
+    return dy_post_isr(dev, &cue, woken);
+}
+
+bool dy_sound_rtos_play_from_isr(dy_sound_t *dev, uint16_t track, BaseType_t *woken)
+{
+    return dy_post_play_isr(dev, track, true, woken);
+}
+
+bool dy_sound_rtos_play_nowait_from_isr(dy_sound_t *dev, uint16_t track, BaseType_t *woken)
+{
+    return dy_post_play_isr(dev, track, false, woken);
+}
+
+bool dy_sound_rtos_stop_from_isr(dy_sound_t *dev, BaseType_t *woken)
+{
+    dy_cue_t cue;
+
+    cue.track = 0u;
+    cue.op    = (uint8_t)DY_OP_STOP;
+    cue.arg   = 0u;
+
+    return dy_post_isr(dev, &cue, woken);
+}
+
+/* -- Introspection ---------------------------------------------------------- */
 
 uint32_t dy_sound_rtos_pending(const dy_sound_t *dev)
 {

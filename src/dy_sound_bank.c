@@ -94,14 +94,14 @@ static const dy_track_t *find_nth(const dy_bank_t *bank, uint16_t id, uint16_t w
  * the cue itself. Nothing above this function has to know which, which is what
  * lets the bank API be called from any task.
  */
-static bool dispatch(dy_sound_t *dev, const dy_track_t *entry)
+static bool dispatch(dy_sound_t *dev, const dy_track_t *entry, bool confirm)
 {
     if (dev->submit != NULL)
     {
-        return dev->submit(dev, entry->track, entry->cycle, true);
+        return dev->submit(dev, entry->track, entry->cycle, confirm);
     }
 
-    return dy_sound_play_ex(dev, entry->track, entry->cycle, true);
+    return dy_sound_play_ex(dev, entry->track, entry->cycle, confirm);
 }
 
 bool dy_sound_bank_attach(dy_sound_t *dev, const dy_bank_t *bank)
@@ -123,7 +123,10 @@ bool dy_sound_bank_attach(dy_sound_t *dev, const dy_bank_t *bank)
     return true;
 }
 
-bool dy_sound_bank_play(dy_sound_t *dev, uint16_t id)
+/* Lookup, rotation and dispatch. The only thing the two public forms disagree
+ * about is whether the driver asks the module what happened afterwards, so
+ * that is the only thing passed in. */
+static bool bank_play(dy_sound_t *dev, uint16_t id, bool confirm)
 {
     const dy_bank_t  *bank = bank_of(dev);
     const dy_track_t *entry;
@@ -150,7 +153,17 @@ bool dy_sound_bank_play(dy_sound_t *dev, uint16_t id)
         dev->rotation++;
     }
 
-    return dispatch(dev, entry);
+    return dispatch(dev, entry, confirm);
+}
+
+bool dy_sound_bank_play(dy_sound_t *dev, uint16_t id)
+{
+    return bank_play(dev, id, true);
+}
+
+bool dy_sound_bank_play_nowait(dy_sound_t *dev, uint16_t id)
+{
+    return bank_play(dev, id, false);
 }
 
 bool dy_sound_bank_select(dy_sound_t *dev, uint16_t id)

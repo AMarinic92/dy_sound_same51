@@ -157,6 +157,60 @@ bool dy_sound_rtos_set_cycle(dy_sound_t *dev, uint8_t mode);
  */
 bool dy_sound_rtos_flush(dy_sound_t *dev);
 
+/**
+ * Ask the module what it is playing, without waiting for the answer. Raises the
+ * DY_ASK_* bits and wakes the sound task to spend them; the answer lands in the
+ * snapshot, which dy_sound_status() reads.
+ *
+ * This is the call for "what is playing?" from anywhere that is not the sound
+ * task. The query itself costs up to reply_ms and drives the UART, so it has to
+ * happen on the task that owns the port - never here.
+ */
+bool dy_sound_rtos_ask(dy_sound_t *dev, uint8_t what);
+
+/* -- From an interrupt ------------------------------------------------------
+ * The producer calls above use the task-context queue functions and must not be
+ * called from an ISR. These are their interrupt-safe twins.
+ *
+ * `woken` is the usual FreeRTOS higher-priority-task-woken flag: pass one in if
+ * the handler already has one to fold into its own yield, or pass NULL and the
+ * call performs the yield itself. NULL is the right answer in a handler that
+ * does nothing else, and it makes the whole thing one line:
+ *
+ *     void BUSY_EdgeHandler(uintptr_t ctx)
+ *     {
+ *         (void)ctx;
+ *         dy_sound_rtos_ask_from_isr(&module, DY_ASK_BOTH, NULL);
+ *     }
+ *
+ * These post to the same queue as everything else, so an ISR cue takes its turn
+ * behind whatever the task is already doing - up to a cue's worth of latency,
+ * which for a sound is inaudible.
+ *
+ * DY_EVENT_DROPPED is NOT emitted when a post from an ISR finds the queue full.
+ * The event callback is application code and typically prints; an ISR is not
+ * the place for it. A false return is the whole report.
+ *
+ * Calling these from a handler above configMAX_SYSCALL_INTERRUPT_PRIORITY is
+ * the usual FreeRTOS error and will assert - the EIC priority MCC assigns is
+ * fine, but check it if you have been editing NVIC priorities by hand.
+ * -------------------------------------------------------------------------- */
+
+/** Raise a what-is-playing request and wake the task to serve it. Repeated
+ *  edges coalesce into one query. */
+bool dy_sound_rtos_ask_from_isr(dy_sound_t *dev, uint8_t what, BaseType_t *woken);
+
+/** Post a track from an ISR, confirming query and all - the task does the
+ *  waiting, the handler returns immediately. */
+bool dy_sound_rtos_play_from_isr(dy_sound_t *dev, uint16_t track, BaseType_t *woken);
+
+/** Post a track from an ISR with no confirming query. Fire and forget: the
+ *  sound task spends one frame on it, ~6 ms at 9600 baud, and is free again. */
+bool dy_sound_rtos_play_nowait_from_isr(dy_sound_t *dev, uint16_t track, BaseType_t *woken);
+
+/** Stop from an ISR. The panic-button path. */
+bool dy_sound_rtos_stop_from_isr(dy_sound_t *dev, BaseType_t *woken);
+
 /* -- Introspection ---------------------------------------------------------- */
 
 /** Cues waiting to be sent. 0 does not mean the module is silent - it means the

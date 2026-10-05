@@ -155,6 +155,23 @@ bool dy_sound_bank_attach(dy_sound_t *dev, const dy_bank_t *bank);
 bool dy_sound_bank_play(dy_sound_t *dev, uint16_t id);
 
 /**
+ * The same cue, fire and forget: the module is told to play and nothing is
+ * asked afterwards.
+ *
+ * dy_sound_bank_play() costs the sound task gap_ms plus a reply window - about
+ * 210 ms when the module answers, 320 ms when it does not - and buys a
+ * confirmation with it. This costs one frame, ~6 ms at 9600 baud, and buys
+ * nothing. That is the right trade when the module's TX line is not wired back
+ * (there is no answer to be had), when a burst of cues would otherwise queue up
+ * behind each other's confirmations, or simply when nobody is going to look.
+ *
+ * The snapshot goes to "unknown" rather than stale: dy_sound_status() reads
+ * track -1 until something asks. Raise a request with dy_sound_rtos_ask() if
+ * you change your mind and do want to know.
+ */
+bool dy_sound_bank_play_nowait(dy_sound_t *dev, uint16_t id);
+
+/**
  * Say what the room's sound should now be. Plays only when `id` differs from
  * the last id selected, so this is safe to call every pass of a loop - which is
  * the whole point, and what removes the LastSoundVariable latch from the

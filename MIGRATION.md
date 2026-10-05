@@ -14,7 +14,10 @@ a track.
 | `Mast.begin()` | `dy_sound_init()` then `dy_sound_rtos_start()` |
 | `Mast.setLoopRule(mastLoops)` | a `cycle` column in the bank table |
 | `Mast.play(14)` | `dy_sound_rtos_play(&mast, 14)` |
-| `Mast.confirmed()` | `dy_sound_confirmed(&mast)` |
+| `Mast.confirmed()` | `dy_sound_confirmed(&mast)`, or `dy_sound_status()` |
+| `Mast.setTrackRequests(true)` | nothing — always armed |
+| `Mast.requestTrack()` | `dy_sound_rtos_ask_from_isr()` / `dy_sound_rtos_ask()` |
+| `Mast.queries()` / `Mast.answers()` | `snap.queries` / `snap.answers` |
 | `Mast.sendRaw(...)` | `dy_sound_send_raw(...)` |
 | `Serial.print` inside the driver | `cfg.on_event` callback |
 | `freertos_due_begin/start` | plain `vTaskStartScheduler()` |
@@ -239,6 +242,52 @@ Port straight across first if you like, then move the table over once it runs.
   how many files are on the card and checks the bank fits, catching the
   copied-in-the-wrong-order SD card that otherwise shows up as every cue playing
   the wrong clip.
+
+## Asking what is playing
+
+`requestTrack()` is `dy_sound_rtos_ask()`, and it works the same way for the same
+reason: the handler behind a BUSY-pin interrupt raises a flag, the sound task
+runs the query, and the UART is still touched from exactly one place. Three
+things are different.
+
+**It can be called from the ISR itself.** The Arduino `requestTrack()` is a plain
+`volatile bool` write that a handler may do, but nothing wakes the task —
+`setTrackRequests(true)` exists to turn the task's blocking wait into a 50 ms
+poll so the flag is eventually noticed. Here `dy_sound_rtos_ask_from_isr()`
+raises the bits *and* posts a wake-up, so the task is woken by the request
+itself. There is no idle poll, no `DY_IDLE_MS`, and nothing to arm: the
+capability is always on and costs nothing until used.
+
+```c
+void BUSY_EdgeHandler(uintptr_t ctx)
+{
+    (void)ctx;
+    dy_sound_rtos_ask_from_isr(&mast, DY_ASK_BOTH, NULL);   // NULL: yield for me
+}
+```
+
+**Play status comes too.** `DY_ASK_STATUS` runs `0x01` alongside `0x0D`, so the
+snapshot says whether the module is playing as well as what — the two halves of
+the question a BUSY edge is really asking.
+
+**The counter dance is gone.** The Arduino README has you sample `queries()`
+before asking and watch it advance, then check `answers()` too, because an
+unanswered query leaves `confirmed()` sitting on the previous track and reading
+like a fresh answer. `dy_sound_status()` returns all of it at once, and `track`
+is -1 whenever the last query went unanswered, so the trap is closed rather than
+documented:
+
+```c
+dy_status_t snap;
+
+dy_sound_status(&mast, &snap);
+
+if (snap.track >= 0) { /* the module said so, just now */ }
+```
+
+`snap.last_track` is the old `confirmed()` behaviour — the last track the module
+ever named, kept across silence — for when you want to explain rather than
+decide.
 
 ## What did not change
 

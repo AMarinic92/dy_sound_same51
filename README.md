@@ -295,6 +295,114 @@ transmit timeout, so `dy_sound_init()` refuses a config without one rather than
 run something that only looks like it works. Without a `delay_ms`, waits
 busy-spin.
 
+## Fire and forget
+
+A confirmed cue occupies the sound task for `gap_ms` plus a reply window — about
+210 ms when the module answers, 320 ms when it does not. The caller never waits,
+but the *next* cue does, so a burst of stingers plays back-to-back at three a
+second at best.
+
+When nobody is going to look at the answer, skip it:
+
+| | Sound task spends | Snapshot afterwards |
+|---|---|---|
+| `dy_sound_rtos_play(&dev, 14)` | ~210–320 ms | the module's answer, or -1 |
+| `dy_sound_rtos_play_nowait(&dev, 14)` | ~6 ms — one frame | -1, "nobody asked" |
+| `dy_sound_bank_play(&dev, SND_CANNON)` | ~210–320 ms | as above |
+| `dy_sound_bank_play_nowait(&dev, SND_CANNON)` | ~6 ms | -1, "nobody asked" |
+
+`_nowait` is not a worse version of the other one. It is the correct version
+when the module's `IO0/TX` is not wired back to the MCU, because then there is
+no answer to be had and the confirming query is 120 ms of waiting for silence,
+per cue, forever.
+
+## Asking what is playing
+
+The module has a BUSY pin, and it answers a different question from the UART:
+the pin says **that** something is playing, the UART says **what**. Watching the
+pin is the application's job — it is the only thing that knows which MCU pin the
+module landed on — but the moment the edge fires, the next thought is "so what is
+it playing?", and that cannot be asked from an interrupt. A query takes up to
+`reply_ms` and drives a UART that belongs to the sound task.
+
+So the handler does not ask. It raises a flag:
+
+```c
+void BUSY_EdgeHandler(uintptr_t ctx)        // EIC callback
+{
+    (void)ctx;
+    dy_sound_rtos_ask_from_isr(&module, DY_ASK_BOTH, NULL);
+}
+```
+
+The sound task spends it on its own time, and the answer waits in a snapshot:
+
+```c
+dy_status_t snap;
+
+dy_sound_status(&module, &snap);            // any task, or an ISR; never blocks
+
+if (snap.playing)
+{
+    printf("track %ld, asked %lu ms ago\n",
+           (long)snap.track,
+           (unsigned long)(xTaskGetTickCount() - snap.asked_ms));
+}
+```
+
+| Field | |
+|---|---|
+| `track` | what the last query named, **-1 if it went unanswered**. The one to act on. |
+| `last_track` | the last track the module ever named. Survives silence. Diagnostic. |
+| `status` | `DY_STATUS_PLAYING` / `PAUSED` / `STOPPED`, or `DY_STATUS_UNKNOWN` |
+| `playing` | `status == DY_STATUS_PLAYING`, for readability |
+| `answered` | the most recent query got a valid reply |
+| `asked_ms` | `now_ms` when that query went out — subtract from now to age it |
+| `queries` / `answers` | totals. Equal after a request means the module replied. |
+
+`track` and `last_track` are two fields because the difference between them is
+the trap. A query the module ignored must not leave the old answer sitting in
+one variable looking current — that is how a module that went quiet five minutes
+ago reads as "still playing track 6". `track` goes to -1 the moment a query is
+ignored, and to -1 again the moment a new cue, stop or pause changes what is
+playing. `last_track` never expires. Act on `track`, explain with `last_track`.
+
+`DY_ASK_TRACK` is `0x0D`, `DY_ASK_STATUS` is `0x01`, `DY_ASK_BOTH` is both.
+Asking for both costs two reply windows on a silent module and about 20 ms on a
+talking one.
+
+| Call | Context | Does |
+|---|---|---|
+| `dy_sound_rtos_ask_from_isr(dev, what, woken)` | ISR | raise + wake the task |
+| `dy_sound_rtos_ask(dev, what)` | any task | raise + wake the task |
+| `dy_sound_ask(dev, what)` | anywhere | raise only, no RTOS call at all |
+| `dy_sound_service(dev)` | the task owning the port | spend whatever is raised |
+| `dy_sound_refresh(dev, what)` | the task owning the port | ask right now, blocking |
+| `dy_sound_status(dev, &snap)` | anywhere, ISR included | read, never transmits |
+
+Some properties worth knowing:
+
+- **Edges coalesce.** The bits are OR-ed, so a bouncing line costs one query,
+  not one per edge. The wake-up carries no payload precisely so that a full
+  queue cannot turn a chattering pin into eight dropped cues.
+- **A cue answers its own request.** A request already pending when a cue's
+  confirming `0x0D` goes out is served by it — the driver does not ask twice for
+  the same thing. One raised *after* that frame is on the wire survives, because
+  it is about a state newer than the answer coming back.
+- **A backed-up queue delays it, never loses it.** The task calls
+  `dy_sound_service()` after *every* item it pulls off the queue, so a request
+  raised during a burst is served after the next cue.
+- **Nothing polls.** There is no idle wake period and no timer — the task sleeps
+  on its queue and the request itself is what wakes it.
+- **`dy_sound_status()` is a seqlock read**, bounded to four attempts because
+  the reader may be the interrupt that preempted the writer. It returns `false`
+  on a torn read and still fills `*out`: fine for reading one field, not for
+  comparing `queries` against `answers`.
+
+On bare metal there is no task to wake, so call `dy_sound_service()` from the
+superloop — it costs a flag test when nothing is pending — or skip the flag and
+call `dy_sound_refresh()` directly.
+
 ## Diagnostics
 
 The library has no stdio dependency. It reports through `cfg.on_event` and lets
@@ -364,9 +472,9 @@ inside the sound task.
 
 | | text |
 |---|---|
-| `dy_sound.c` | 1776 B |
-| `dy_sound_bank.c` | 620 B |
-| `dy_sound_freertos.c` | 852 B, or 0 without the define |
+| `dy_sound.c` | 2268 B |
+| `dy_sound_bank.c` | 664 B |
+| `dy_sound_freertos.c` | 1168 B, or 0 without the define |
 
 XC32 4.60 at `-O1`, no static RAM beyond the `dy_sound_t` you declare. Set
 `DY_SOUND_LABELS=0` to drop the bank's label strings.

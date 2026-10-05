@@ -134,6 +134,19 @@ extern "C" {
 #define DY_STATUS_PLAYING      0x01u
 #define DY_STATUS_PAUSED       0x02u
 
+/** Not a value the module reports: "it has never answered a status query".
+ *  A snapshot taken before anything was ever asked reads this, and so does one
+ *  taken from a module whose TX line is not connected. */
+#define DY_STATUS_UNKNOWN      0xFFu
+
+/* -- Asking what is playing -------------------------------------------------
+ * A bit per query, OR them together. These are what dy_sound_ask() raises and
+ * dy_sound_service() spends - see "Asking from an interrupt" below.
+ * -------------------------------------------------------------------------- */
+#define DY_ASK_TRACK           0x01u   /**< 0x0D - which track                */
+#define DY_ASK_STATUS          0x02u   /**< 0x01 - playing, paused or stopped */
+#define DY_ASK_BOTH            0x03u
+
 /* -- Types ------------------------------------------------------------------ */
 
 /**
@@ -199,6 +212,35 @@ typedef enum
 
 typedef void (*dy_event_cb_t)(uintptr_t context, dy_event_t event,
                               uint16_t track, int reported);
+
+/**
+ * Everything the driver knows about what the module is doing, read out in one
+ * piece. See dy_sound_status().
+ *
+ * `track` and `last_track` are deliberately two fields, because the difference
+ * between them is the trap. A query the module ignored cannot leave the old
+ * answer sitting in one variable and call it current - that is how a module
+ * that went silent five minutes ago reads as "still playing track 6". So
+ * `track` is the answer to the LAST query and goes to -1 the moment one is
+ * ignored, while `last_track` is the last thing the module ever admitted to and
+ * never expires. Use `track` to decide, `last_track` to explain.
+ */
+typedef struct
+{
+    int32_t  track;       /**< what the last query named; -1 if it went
+                           *   unanswered. The one to act on.               */
+    int32_t  last_track;  /**< last track the module EVER named, or -1. This
+                           *   one survives silence - diagnostic.           */
+    uint8_t  status;      /**< DY_STATUS_PLAYING / PAUSED / STOPPED, or
+                           *   DY_STATUS_UNKNOWN if 0x01 was never answered */
+    bool     playing;     /**< status == DY_STATUS_PLAYING, for readability */
+    bool     answered;    /**< the most recent query got a valid reply      */
+    uint32_t asked_ms;    /**< now_ms when that query went out. Subtract it
+                           *   from now to age the snapshot.                */
+    uint32_t queries;     /**< queries sent, ever                           */
+    uint32_t answers;     /**< of those, the ones answered. Equal counters
+                           *   after a request means the module replied.    */
+} dy_status_t;
 
 /* Forward declaration - the submit hook takes the device it belongs to. */
 struct dy_sound_s;
@@ -271,8 +313,33 @@ typedef struct dy_sound_s
     uint8_t         cycle_now;        /**< last mode sent, to avoid resending  */
     bool            ready;            /**< begin() has run                     */
 
+    /* -- The snapshot ------------------------------------------------------
+     * Written only by whichever task owns the port, read from anywhere -
+     * another task, or an ISR. `seq` is what makes that safe: the writer bumps
+     * it to odd before touching anything and back to even when it is done, so
+     * a reader that sees the same even value either side of its copy knows the
+     * copy did not straddle an update. Individually these fields are all
+     * word-sized and would not tear on their own; the seq is there because a
+     * caller that reads `answers` and `track` wants them to be from the SAME
+     * query, and that is not something volatile alone can promise.
+     * ---------------------------------------------------------------------- */
+    volatile uint32_t status_seq;
+
     volatile int32_t confirmed;       /**< last track the module admitted to,
                                        *   or -1 if it did not answer          */
+    volatile int32_t last_track;      /**< last track ever named; survives an
+                                       *   unanswered query                    */
+    volatile uint8_t status;          /**< DY_STATUS_*, or DY_STATUS_UNKNOWN   */
+    volatile bool    answered;        /**< the most recent query was answered  */
+    volatile uint32_t asked_ms;       /**< now_ms when that query went out     */
+    volatile uint32_t queries;        /**< queries sent, ever                  */
+    volatile uint32_t answers;        /**< of those, the answered ones         */
+
+    /** Bits raised by dy_sound_ask(), spent by dy_sound_service(). Set from an
+     *  ISR, cleared by the sound task, so both ends go through a short PRIMASK
+     *  critical section - an OR and a clear that interleave would otherwise
+     *  lose a request. */
+    volatile uint8_t ask_flags;
 
     /* Reserved for the optional bank layer in dy_sound_bank.c. */
     const void     *bank;             /**< dy_bank_t, attached or NULL         */
@@ -378,6 +445,94 @@ bool dy_sound_query_song_count(dy_sound_t *dev, uint16_t *out);  /**< 0x0C */
  * gone quiet must not make the status read 0. Report the commanded track.
  */
 int dy_sound_confirmed(const dy_sound_t *dev);
+
+/**
+ * Copy out everything the driver knows in one consistent piece - which track,
+ * whether the module says it is playing, when it last said so, and how many
+ * queries it has bothered to answer.
+ *
+ * Safe from any task and from an ISR. It reads, it never transmits, so it costs
+ * a couple of dozen cycles and cannot block. It does not ask the module
+ * anything: it hands back the last answer. To get a fresh one, raise a request
+ * with dy_sound_ask() (or dy_sound_rtos_ask_from_isr()) and read the snapshot
+ * once the sound task has served it.
+ *
+ * Returns false if the snapshot could not be read consistently, which in
+ * practice means an ISR called this while the sound task was halfway through an
+ * update. *out is still filled in - the fields are simply not guaranteed to be
+ * from the same query - so a caller that only wants `playing` can ignore the
+ * return value, and one comparing `queries` against `answers` should not.
+ */
+bool dy_sound_status(const dy_sound_t *dev, dy_status_t *out);
+
+/* -- Asking from an interrupt -----------------------------------------------
+ * The module has a BUSY pin, and it answers a different question from the one
+ * the UART answers: the pin says THAT something is playing, the UART says WHAT.
+ * Watching the pin is the application's job - it is the only thing that knows
+ * which MCU pin the module landed on - but the moment the edge fires, the
+ * natural next thought is "so what is it playing?", and that cannot be asked
+ * from an ISR. A query takes up to reply_ms and drives a UART that belongs to
+ * another task.
+ *
+ * So the ISR does not ask. It raises a flag:
+ *
+ *     void BUSY_EdgeHandler(uintptr_t ctx)        // EIC callback
+ *     {
+ *         (void)ctx;
+ *         dy_sound_rtos_ask_from_isr(&module, DY_ASK_BOTH, NULL);
+ *     }
+ *
+ * and the sound task spends it on its own time, into the snapshot:
+ *
+ *     dy_status_t snap;
+ *     dy_sound_status(&module, &snap);
+ *     if (snap.playing) { ... snap.track ... }
+ *
+ * Repeated edges coalesce: the bits are OR-ed, so a bouncing line costs one
+ * query, not one per edge. A request raised while a cue is confirming itself is
+ * answered by that cue's own 0x0D - the driver does not ask twice for the same
+ * thing.
+ * -------------------------------------------------------------------------- */
+
+/**
+ * Raise a request. `what` is DY_ASK_TRACK, DY_ASK_STATUS or DY_ASK_BOTH, OR-ed
+ * into whatever is already pending. Sets bits and returns; it never transmits,
+ * never blocks and touches no FreeRTOS object, so it is safe from an ISR at any
+ * priority, from any task, and from before the scheduler starts.
+ *
+ * On its own this only arms the request - something has to come along and spend
+ * it. Under the FreeRTOS layer call dy_sound_rtos_ask() or
+ * dy_sound_rtos_ask_from_isr() instead, which raise the same bits AND wake the
+ * sound task to serve them. Bare metal, call dy_sound_service() from your loop.
+ */
+void dy_sound_ask(dy_sound_t *dev, uint8_t what);
+
+/** The bits still waiting to be served, or 0. */
+uint8_t dy_sound_ask_pending(const dy_sound_t *dev);
+
+/**
+ * Serve whatever dy_sound_ask() has raised, and clear it. Returns the bits that
+ * were actually answered - 0 when nothing was pending, and also 0 when the
+ * module stayed silent, which is why the snapshot carries `answered` rather
+ * than leaving you to infer it.
+ *
+ * Drives the UART, so this runs where the port lives: the sound task under the
+ * FreeRTOS layer (which calls it for you after every cue), or the superloop on
+ * bare metal. Costs nothing when no request is pending, which is the normal
+ * case, and up to reply_ms per bit when one is.
+ */
+uint8_t dy_sound_service(dy_sound_t *dev);
+
+/**
+ * Ask right now, on this task, without going through the flag at all. Blocks
+ * for up to reply_ms per bit requested. Same return value as
+ * dy_sound_service(); the snapshot is updated either way.
+ *
+ * Under the FreeRTOS layer this belongs to the sound task. From another task,
+ * raise a request instead - two tasks driving the port interleave bytes
+ * mid-frame.
+ */
+uint8_t dy_sound_refresh(dy_sound_t *dev, uint8_t what);
 
 /* -- Escape hatch ----------------------------------------------------------- */
 
